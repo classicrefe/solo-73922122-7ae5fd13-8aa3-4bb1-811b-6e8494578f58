@@ -9,6 +9,10 @@ dup_groups         : groups of files sharing a sample; exactly one must be
 generations        : merge runs, tagged with the ``selection_version`` they
                      were started with; any later selection change invalidates
                      them immediately
+analyses           : low-frequency interval analysis runs against one
+                     generation's output; a selection change or a new
+                     generation invalidates them immediately, and currency is
+                     re-checked live whenever a result is served
 
 The schema deliberately keeps no per-locus data: VCF contents stay on disk
 and the database only tracks workflow state.
@@ -115,9 +119,27 @@ CREATE TABLE IF NOT EXISTS generations (
     finished_at        TEXT
 );
 
+CREATE TABLE IF NOT EXISTS analyses (
+    id                 TEXT PRIMARY KEY,
+    batch_id           TEXT NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+    -- The generation whose output VCF this analysis ran on; the result is
+    -- only current while that generation is the batch's latest, still done,
+    -- and still matches the live selection_version.
+    generation_id      TEXT NOT NULL REFERENCES generations(id) ON DELETE CASCADE,
+    status             TEXT NOT NULL,
+    selection_version  INTEGER NOT NULL,
+    intervals_json     TEXT NOT NULL,
+    result_json        TEXT,
+    error              TEXT,
+    created_at         TEXT NOT NULL,
+    started_at         TEXT,
+    finished_at        TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_files_batch ON vcf_files(batch_id);
 CREATE INDEX IF NOT EXISTS idx_dup_batch ON dup_groups(batch_id);
 CREATE INDEX IF NOT EXISTS idx_gen_batch ON generations(batch_id);
+CREATE INDEX IF NOT EXISTS idx_analyses_batch ON analyses(batch_id);
 """
 
 
@@ -134,6 +156,17 @@ def init_db() -> None:
                     config.STATUS_FAILED,
                     _now(),
                     "服务在合并完成前重启，该在途生成判定失败",
+                    config.STATUS_PENDING,
+                    config.STATUS_RUNNING,
+                ),
+            )
+            conn.execute(
+                "UPDATE analyses SET status=?, finished_at=?, "
+                "error=COALESCE(error, ?) WHERE status IN (?, ?)",
+                (
+                    config.STATUS_FAILED,
+                    _now(),
+                    "服务在分析完成前重启，该在途分析判定失败",
                     config.STATUS_PENDING,
                     config.STATUS_RUNNING,
                 ),
@@ -210,6 +243,109 @@ def get_running_generations(conn: sqlite3.Connection) -> list[sqlite3.Row]:
         "SELECT * FROM generations WHERE status IN (?, ?)",
         (config.STATUS_PENDING, config.STATUS_RUNNING),
     ).fetchall()
+
+
+# --------------------------------------------------------------------------- #
+# Analyses
+# --------------------------------------------------------------------------- #
+def create_analysis(
+    conn: sqlite3.Connection,
+    batch_id: str,
+    generation_id: str,
+    selection_version: int,
+    intervals: list[dict],
+) -> str:
+    analysis_id = new_id()
+    conn.execute(
+        "INSERT INTO analyses(id, batch_id, generation_id, status, "
+        "selection_version, intervals_json, created_at) "
+        "VALUES(?, ?, ?, ?, ?, ?, ?)",
+        (
+            analysis_id,
+            batch_id,
+            generation_id,
+            config.STATUS_PENDING,
+            selection_version,
+            json.dumps(intervals),
+            _now(),
+        ),
+    )
+    return analysis_id
+
+
+def get_analysis(conn: sqlite3.Connection, analysis_id: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM analyses WHERE id=?", (analysis_id,)
+    ).fetchone()
+
+
+def get_latest_analysis(
+    conn: sqlite3.Connection, batch_id: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM analyses WHERE batch_id=? ORDER BY rowid DESC LIMIT 1",
+        (batch_id,),
+    ).fetchone()
+
+
+def get_active_analysis(
+    conn: sqlite3.Connection, batch_id: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM analyses WHERE batch_id=? AND status IN (?, ?) "
+        "ORDER BY created_at DESC LIMIT 1",
+        (batch_id, config.STATUS_PENDING, config.STATUS_RUNNING),
+    ).fetchone()
+
+
+def mark_analysis(
+    conn: sqlite3.Connection,
+    analysis_id: str,
+    status: str,
+    *,
+    result: dict | None = None,
+    error: str | None = None,
+    started: bool = False,
+    finished: bool = False,
+) -> None:
+    sets = ["status=?"]
+    params: list[Any] = [status]
+    if result is not None:
+        sets.append("result_json=?")
+        params.append(json.dumps(result))
+    if error is not None:
+        sets.append("error=?")
+        params.append(error)
+    if started:
+        sets.append("started_at=?")
+        params.append(_now())
+    if finished:
+        sets.append("finished_at=?")
+        params.append(_now())
+    params.append(analysis_id)
+    conn.execute(f"UPDATE analyses SET {', '.join(sets)} WHERE id=?", params)
+
+
+def invalidate_analyses(conn: sqlite3.Connection, batch_id: str, reason: str) -> None:
+    """Supersede every pending/running/done analysis of a batch immediately.
+
+    Called when the take-source selection changes or a new cohort generation
+    starts, so an old result table can never be served as the current one.
+    """
+    conn.execute(
+        "UPDATE analyses SET status=?, error=?, "
+        "finished_at=COALESCE(finished_at, ?) "
+        "WHERE batch_id=? AND status IN (?, ?, ?)",
+        (
+            config.STATUS_SUPERSEDED,
+            reason,
+            _now(),
+            batch_id,
+            config.STATUS_PENDING,
+            config.STATUS_RUNNING,
+            config.STATUS_DONE,
+        ),
+    )
 
 
 # --------------------------------------------------------------------------- #

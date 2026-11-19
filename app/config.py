@@ -34,6 +34,12 @@ STATUS_FAILED = "failed"
 STATUS_SUPERSEDED = "superseded"
 STATUS_ABORTED = "aborted"
 
+# Low-frequency variant interval analysis.
+MAX_INTERVALS = 10
+MAX_COORD = 10**12
+# Alleles with 0 < AC/AN <= LOW_FREQ_MAX_AF are considered low frequency.
+LOW_FREQ_MAX_AF = 0.25
+
 TERMINAL_STATUSES = {STATUS_DONE, STATUS_FAILED, STATUS_SUPERSEDED, STATUS_ABORTED}
 
 

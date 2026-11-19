@@ -19,6 +19,7 @@ import threading
 from pathlib import Path
 
 from . import config, cross_check, db
+from .analysis import AnalysisAborted, AnalysisError, parse_intervals, run_analysis
 from .merge import MergeAborted, SampleSource, merge_vcfs
 from .validation import validate_vcf
 
@@ -248,6 +249,11 @@ def start_generation(batch_id: str) -> str:
         assert_generation_allowed(conn, batch_id)
         version = db.get_batch(conn, batch_id)["selection_version"]
         gen_id = db.create_generation(conn, batch_id, version)
+        # A regenerated cohort result supersedes every earlier analysis:
+        # they were computed from a cohort VCF that is no longer current.
+        db.invalidate_analyses(
+            conn, batch_id, "队列结果已重新生成，旧分析结果随之失效"
+        )
 
     thread = threading.Thread(
         target=_run_generation,
@@ -269,6 +275,11 @@ def change_selection(batch_id: str, group_id: str, file_id: str | None) -> None:
         if updated is None:
             raise SelectionError("选择无效")
         db.bump_selection_version(conn, batch_id)
+        # Analyses ran on the cohort VCF of the previous take-source set;
+        # they must stop being displayable as the current result at once.
+        db.invalidate_analyses(
+            conn, batch_id, "取用源选择已变更，分析结果随之失效"
+        )
 
     # Remove output files of generations that were just superseded so no
     # half-product or stale result can ever be downloaded.
@@ -293,3 +304,149 @@ def _safe_remove(path: str | None) -> None:
         os.unlink(path)
     except FileNotFoundError:
         pass
+
+
+# --------------------------------------------------------------------------- #
+# Low-frequency interval analysis
+# --------------------------------------------------------------------------- #
+def _run_analysis(analysis_id: str) -> None:
+    with db.get_db() as conn:
+        analysis = db.get_analysis(conn, analysis_id)
+        if analysis is None:
+            return
+        db.mark_analysis(conn, analysis_id, config.STATUS_RUNNING, started=True)
+        batch_id = analysis["batch_id"]
+        generation_id = analysis["generation_id"]
+        version = analysis["selection_version"]
+        generation = db.get_generation(conn, generation_id)
+        output_path = generation["output_path"] if generation else None
+        try:
+            intervals = parse_intervals(json.loads(analysis["intervals_json"]))
+        except AnalysisError as exc:  # defensive: intervals were validated at submit
+            db.mark_analysis(
+                conn, analysis_id, config.STATUS_FAILED,
+                error=str(exc), finished=True,
+            )
+            return
+
+    if not output_path or not Path(output_path).is_file():
+        with db.get_db() as conn:
+            db.mark_analysis(
+                conn, analysis_id, config.STATUS_FAILED,
+                error="队列结果文件不存在，无法分析", finished=True,
+            )
+        return
+
+    def is_aborted() -> bool:
+        """The analysis is void the moment its cohort result stops being the
+        current one: selection changed, generation superseded/regenerated,
+        or the output file disappeared."""
+        with db.get_db() as check_conn:
+            batch = db.get_batch(check_conn, batch_id)
+            gen = db.get_generation(check_conn, generation_id)
+            latest = db.get_latest_generation(check_conn, batch_id)
+            current = db.get_analysis(check_conn, analysis_id)
+            if batch is None or gen is None or latest is None or current is None:
+                return True
+            if current["status"] != config.STATUS_RUNNING:
+                return True
+            if batch["selection_version"] != version:
+                return True
+            if gen["status"] != config.STATUS_DONE:
+                return True
+            if latest["id"] != generation_id:
+                return True
+            return not Path(output_path).is_file()
+
+    try:
+        result = run_analysis(output_path, intervals, is_aborted=is_aborted)
+    except AnalysisAborted:
+        with db.get_db() as conn:
+            current = db.get_analysis(conn, analysis_id)
+            if current is not None and current["status"] == config.STATUS_RUNNING:
+                db.mark_analysis(
+                    conn, analysis_id, config.STATUS_SUPERSEDED,
+                    error="分析期间队列结果已变更，该在途分析立即失效",
+                    finished=True,
+                )
+        return
+    except Exception as exc:  # noqa: BLE001 - failure reason must be surfaced
+        logger.warning("analysis %s failed: %s", analysis_id, exc)
+        with db.get_db() as conn:
+            db.mark_analysis(
+                conn, analysis_id, config.STATUS_FAILED,
+                error=f"分析失败：{exc}", finished=True,
+            )
+        return
+
+    # Re-check before publishing: never publish a result computed from a
+    # cohort VCF that stopped being current while the scan was running.
+    if is_aborted():
+        with db.get_db() as conn:
+            current = db.get_analysis(conn, analysis_id)
+            if current is not None and current["status"] == config.STATUS_RUNNING:
+                db.mark_analysis(
+                    conn, analysis_id, config.STATUS_SUPERSEDED,
+                    error="分析期间队列结果已变更，结果不予发布",
+                    finished=True,
+                )
+        return
+
+    logger.info("analysis %s done on generation %s", analysis_id, generation_id)
+    with db.get_db() as conn:
+        db.mark_analysis(
+            conn, analysis_id, config.STATUS_DONE, result=result, finished=True
+        )
+
+
+def start_analysis(batch_id: str, raw_intervals) -> str:
+    """Validate the request synchronously, then spawn the analysis worker.
+
+    The analysis always targets the batch's *current* completed cohort VCF:
+    the latest generation, done, version-matched, with its file on disk --
+    exactly the file the download endpoint would serve.
+    """
+    intervals = parse_intervals(raw_intervals)  # AnalysisError (400) on bad input
+    with db.get_db() as conn:
+        batch = db.get_batch(conn, batch_id)
+        if batch is None:
+            raise AnalysisError("批次不存在", status_code=404)
+        latest = db.get_latest_generation(conn, batch_id)
+        if latest is None or latest["status"] != config.STATUS_DONE:
+            raise AnalysisError(
+                "当前没有已完成的队列 VCF，请先生成队列结果", status_code=409
+            )
+        if latest["selection_version"] != batch["selection_version"]:
+            raise AnalysisError(
+                "取用源已变更，最新队列结果不属于当前选择，请重新生成后再分析",
+                status_code=409,
+            )
+        if not latest["output_path"] or not Path(latest["output_path"]).is_file():
+            raise AnalysisError(
+                "队列结果文件不存在（可能因服务重启未完成），请重新生成后再分析",
+                status_code=409,
+            )
+        if db.get_active_analysis(conn, batch_id) is not None:
+            raise AnalysisError(
+                "已有一个分析任务在进行中，请等待其结束", status_code=409
+            )
+        intervals_payload = [
+            {"gene": iv.gene, "chrom": iv.chrom, "start": iv.start, "end": iv.end}
+            for iv in intervals
+        ]
+        analysis_id = db.create_analysis(
+            conn,
+            batch_id,
+            latest["id"],
+            batch["selection_version"],
+            intervals_payload,
+        )
+
+    thread = threading.Thread(
+        target=_run_analysis,
+        args=(analysis_id,),
+        name=f"analysis-{analysis_id[:8]}",
+        daemon=True,
+    )
+    thread.start()
+    return analysis_id

@@ -126,12 +126,35 @@
   #toast.show { opacity: 1; }
   .muted { color: var(--muted); }
   .pill-row { display: flex; gap: 8px; flex-wrap: wrap; margin: 6px 0; }
+  .interval-row input {
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 13px;
+    width: 100%;
+  }
+  .interval-row input[type="number"] { width: 110px; }
+  .icon-btn {
+    background: #e5e9f0;
+    color: var(--err);
+    padding: 4px 10px;
+    font-size: 13px;
+  }
+  .gene-block {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 14px;
+    margin: 12px 0;
+  }
+  .gene-block h4 { margin: 0 0 8px; font-size: 14px; }
+  .sub-table { margin: 8px 0 4px; }
+  .sub-caption { color: var(--muted); font-size: 12px; margin: 8px 0 4px; }
 </style>
 </head>
 <body>
 <header>
   <h1>VCF 队列合并服务</h1>
-  <p>上传 2~3 份同参考版本、坐标排序的二倍体 VCF，选择重复样本唯一取用原件，生成关联分析用队列 VCF</p>
+  <p>上传 2~3 份同参考版本、坐标排序的二倍体 VCF，选择重复样本唯一取用原件，生成关联分析用队列 VCF；并可按基因区间分析样本携带的低频变异</p>
 </header>
 
 <main>
@@ -188,6 +211,35 @@
       </div>
       <div id="genStatus" class="hint"></div>
     </section>
+
+    <section class="card">
+      <h2>5. 低频变异区间分析</h2>
+      <p class="hint">
+        基于当前已完成的队列 VCF，按基因区间（1 基闭区间，至多 10 条）统计
+        0&lt;AC/AN≤0.25 的低频等位基因。仅处理 REF 与所有 ALT 均为单碱基的 SNV；
+        AC/AN 只按非缺失二倍体 GT 计算，缺失 GT 绝不当作 0/0；
+        同一基因的重叠区间只统计一次。染色体名需与 VCF 的 contig 命名一致（如 chr1）。
+      </p>
+      <div id="analysisSource" class="hint"></div>
+      <table>
+        <thead>
+          <tr>
+            <th style="width:26%">基因名</th>
+            <th style="width:22%">染色体</th>
+            <th style="width:16%">起点（1 基）</th>
+            <th style="width:16%">终点（闭区间）</th>
+            <th style="width:8%"></th>
+          </tr>
+        </thead>
+        <tbody id="intervalsBody"></tbody>
+      </table>
+      <div class="pill-row">
+        <button id="addIntervalBtn" class="secondary">添加区间</button>
+        <button id="analyzeBtn">开始分析</button>
+      </div>
+      <div id="analysisStatus" class="hint"></div>
+      <div id="analysisResult"></div>
+    </section>
   </div>
 </main>
 
@@ -197,6 +249,9 @@
 const $ = (id) => document.getElementById(id);
 let batchId = null;
 let pollTimer = null;
+let analysisPollTimer = null;
+let lastGenKey = null;
+let intervalRows = [{ gene: "", chrom: "", start: "", end: "" }];
 
 function toast(msg) {
   const el = $("toast");
@@ -314,6 +369,27 @@ function renderBatch(data) {
   } else {
     $("generateBtn").title = "";
   }
+
+  // 分析区联动：分析对象始终是"当前已完成的队列 VCF"（即可下载的那份）。
+  if (gen && gen.downloadable) {
+    $("analysisSource").innerHTML =
+      `分析对象：当前队列结果 <span class="mono">${esc(gen.id.slice(0, 8))}</span>` +
+      `（选择版本 v${gen.selection_version}，创建于 ${esc(gen.created_at || "")}）`;
+    $("analyzeBtn").disabled = false;
+  } else {
+    $("analysisSource").textContent =
+      "当前没有已完成的队列 VCF，请先在第 4 步生成；生成完成后才能分析。";
+    $("analyzeBtn").disabled = true;
+  }
+  // 队列结果身份变化（新生成/失效/版本变更）时刷新分析区，旧表不得继续
+  // 作为当前结果展示。
+  const genKey = gen
+    ? `${gen.id}:${gen.status}:${data.selection_version}`
+    : `none:${data.selection_version}`;
+  if (genKey !== lastGenKey) {
+    lastGenKey = genKey;
+    fetchAnalysis();
+  }
 }
 
 async function fetchBatch() {
@@ -390,6 +466,182 @@ $("downloadBtn").addEventListener("click", () => {
 });
 
 $("refreshBtn").addEventListener("click", fetchBatch);
+
+// ---------------------------------------------------------------------------
+// 低频变异区间分析
+// ---------------------------------------------------------------------------
+function renderIntervalRows() {
+  $("intervalsBody").innerHTML = intervalRows.map((row, i) => `
+    <tr class="interval-row">
+      <td><input data-i="${i}" data-f="gene" value="${esc(row.gene)}" placeholder="如 BRCA1"></td>
+      <td><input data-i="${i}" data-f="chrom" value="${esc(row.chrom)}" placeholder="如 chr1"></td>
+      <td><input data-i="${i}" data-f="start" type="number" min="1" value="${esc(row.start)}" placeholder="1"></td>
+      <td><input data-i="${i}" data-f="end" type="number" min="1" value="${esc(row.end)}" placeholder="1000"></td>
+      <td><button class="icon-btn" data-del="${i}" ${intervalRows.length <= 1 ? "disabled" : ""}>删除</button></td>
+    </tr>`).join("");
+  document.querySelectorAll("#intervalsBody input").forEach((inp) => {
+    inp.addEventListener("input", () => {
+      intervalRows[Number(inp.dataset.i)][inp.dataset.f] = inp.value;
+    });
+  });
+  document.querySelectorAll("button[data-del]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      intervalRows.splice(Number(btn.dataset.del), 1);
+      renderIntervalRows();
+    });
+  });
+  $("addIntervalBtn").disabled = intervalRows.length >= 10;
+}
+
+$("addIntervalBtn").addEventListener("click", () => {
+  if (intervalRows.length >= 10) { toast("最多填写 10 条区间"); return; }
+  intervalRows.push({ gene: "", chrom: "", start: "", end: "" });
+  renderIntervalRows();
+});
+
+$("analyzeBtn").addEventListener("click", async () => {
+  if (!batchId) return;
+  const intervals = [];
+  for (const row of intervalRows) {
+    const gene = row.gene.trim();
+    const chrom = row.chrom.trim();
+    const start = Number(row.start);
+    const end = Number(row.end);
+    if (!gene || !chrom) { toast("每条区间都要填写基因名和染色体"); return; }
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start) {
+      toast(`基因 ${gene} 的区间起终点无效（要求 1≤起点≤终点的 1 基闭区间）`);
+      return;
+    }
+    intervals.push({ gene, chrom, start, end });
+  }
+  if (!intervals.length) { toast("至少需要 1 条区间"); return; }
+  if (intervals.length > 10) { toast("最多 10 条区间"); return; }
+  try {
+    const resp = await fetch(`/api/batches/${batchId}/analyses`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ intervals }),
+    });
+    const payload = await resp.json();
+    if (!resp.ok) {
+      const detail = typeof payload.detail === "string" ? payload.detail : "请求参数无效";
+      toast(detail);
+      fetchAnalysis();
+      return;
+    }
+    toast("分析任务已启动");
+    renderAnalysis(payload);
+  } catch (err) {
+    toast("分析请求失败：" + err);
+  }
+});
+
+async function fetchAnalysis() {
+  if (!batchId) return;
+  try {
+    const resp = await fetch(`/api/batches/${batchId}/analyses/latest`);
+    if (!resp.ok) return;
+    const payload = await resp.json();
+    renderAnalysis(payload.analysis);
+  } catch (err) { /* 网络抖动时保持现状，下轮再试 */ }
+}
+
+function scheduleAnalysisPoll() {
+  if (analysisPollTimer) return;
+  analysisPollTimer = setInterval(fetchAnalysis, 1500);
+}
+
+function stopAnalysisPoll() {
+  if (analysisPollTimer) { clearInterval(analysisPollTimer); analysisPollTimer = null; }
+}
+
+function renderAnalysis(a) {
+  const statusEl = $("analysisStatus");
+  const resultEl = $("analysisResult");
+  if (!a) {
+    statusEl.textContent = "尚未分析";
+    resultEl.innerHTML = "";
+    stopAnalysisPoll();
+    return;
+  }
+  const running = a.status === "pending" || a.status === "running";
+  const genRef = `队列结果 ${esc(a.generation_id.slice(0, 8))}（选择版本 v${a.selection_version}）`;
+  if (running) {
+    statusEl.innerHTML = `<span class="spinner"></span>分析中…（基于${genRef}）`;
+  } else if (a.status === "done" && a.is_current) {
+    statusEl.innerHTML = `<span class="status-done">分析完成</span>（基于${genRef}）`;
+  } else if (a.status === "done") {
+    statusEl.innerHTML = `<span class="status-superseded">该分析结果已失效</span>（基于${genRef}）`;
+  } else if (a.status === "failed") {
+    statusEl.innerHTML = `<span class="status-failed">分析失败</span>`;
+  } else {
+    statusEl.innerHTML = `<span class="status-superseded">该分析已失效</span>`;
+  }
+  if (a.error && a.status !== "done") {
+    statusEl.innerHTML += `<div class="error-box">${esc(a.error)}</div>`;
+  }
+
+  if (a.status === "done" && a.is_current && a.result) {
+    resultEl.innerHTML = renderAnalysisResult(a.result);
+  } else if (a.status === "done" && !a.is_current) {
+    // 旧表不可继续显示为当前结果：只显示失效提示，不渲染结果表。
+    resultEl.innerHTML = `<div class="error-box" style="background:var(--warn-bg);color:var(--warn);border-color:#f0dcb6;">
+      该分析结果已失效（${esc(a.stale_reason || "队列结果已变更")}），不再代表当前队列结果，请重新分析。
+    </div>`;
+  } else {
+    resultEl.innerHTML = "";
+  }
+
+  if (running) scheduleAnalysisPoll(); else stopAnalysisPoll();
+}
+
+function renderAnalysisResult(result) {
+  return result.genes.map((g) => {
+    const intervals = g.intervals
+      .map((iv) => `${esc(iv.chrom)}:${iv.start}-${iv.end}`).join("，");
+    const badges = `
+      <span class="badge info">合并后区间：${intervals}</span>
+      <span class="badge info">SNV 位点：${g.snv_sites}</span>
+      <span class="badge info">候选位点：${g.candidate_sites}</span>
+      <span class="badge ${g.skipped_non_snv ? "warn" : "info"}">跳过非 SNV：${g.skipped_non_snv}</span>`;
+    let alleleTable = "";
+    if (g.alleles.length) {
+      alleleTable = `
+        <p class="sub-caption">低频等位基因（0&lt;AC/AN≤0.25）${g.alleles_truncated ? "（仅显示前 500 条）" : ""}</p>
+        <table class="sub-table">
+          <thead><tr><th>位点</th><th>REF</th><th>ALT</th><th>AC</th><th>AN</th><th>AC/AN</th></tr></thead>
+          <tbody>${g.alleles.map((al) => `<tr>
+            <td class="mono">${esc(al.chrom)}:${al.pos}</td>
+            <td class="mono">${esc(al.ref)}</td>
+            <td class="mono">${esc(al.alt)}</td>
+            <td>${al.ac}</td><td>${al.an}</td>
+            <td>${al.af.toFixed(4)}</td>
+          </tr>`).join("")}</tbody>
+        </table>`;
+    }
+    let sampleTable = "";
+    if (g.candidate_sites > 0) {
+      sampleTable = `
+        <p class="sub-caption">逐样本携带情况（缺失 GT 不计入，也绝不当作 0/0）</p>
+        <table class="sub-table">
+          <thead><tr><th>样本</th><th>低频 ALT 拷贝数</th><th>有 GT 的候选位点数</th></tr></thead>
+          <tbody>${result.samples.map((s) => {
+            const row = g.per_sample[s];
+            const copies = row.computable
+              ? String(row.alt_copies)
+              : '<span class="badge warn">无法计算</span>';
+            return `<tr><td class="mono">${esc(s)}</td><td>${copies}</td><td>${row.called_sites}</td></tr>`;
+          }).join("")}</tbody>
+        </table>`;
+    } else {
+      sampleTable = '<p class="hint">该基因区间内无 0&lt;AC/AN≤0.25 的低频等位基因，没有候选位点可统计。</p>';
+    }
+    return `<div class="gene-block"><h4>基因 ${esc(g.gene)}</h4>
+      <div class="pill-row">${badges}</div>${alleleTable}${sampleTable}</div>`;
+  }).join("");
+}
+
+renderIntervalRows();
 </script>
 </body>
 </html>

@@ -8,8 +8,10 @@ from pathlib import Path
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from . import config, db, service
+from .analysis import AnalysisError
 from .service import SelectionError
 
 
@@ -84,6 +86,56 @@ def _generation_payload(row) -> dict:
             and row["output_path"]
             and Path(row["output_path"]).is_file()
         ),
+    }
+
+
+def _analysis_currency(conn, row) -> tuple[bool, str | None]:
+    """Live check: may this analysis still be shown as the current result?
+
+    A done analysis is current only while the cohort generation it ran on is
+    still the batch's latest, still done, version-matched to the live
+    selection, and its output file still exists. Anything else means the
+    take-source changed or the cohort result was regenerated/invalidated,
+    and the old table must not be served as current.
+    """
+    if row["status"] != config.STATUS_DONE:
+        return False, None
+    batch = db.get_batch(conn, row["batch_id"])
+    generation = db.get_generation(conn, row["generation_id"])
+    if batch is None or generation is None:
+        return False, "队列结果已不存在"
+    if generation["selection_version"] != batch["selection_version"]:
+        return False, "取用源已变更，该分析不再代表当前队列结果"
+    if generation["status"] != config.STATUS_DONE:
+        return False, "分析所基于的队列结果已失效"
+    latest = db.get_latest_generation(conn, row["batch_id"])
+    if latest is None or latest["id"] != row["generation_id"]:
+        return False, "队列结果已重新生成，该分析不再代表当前队列结果"
+    output_path = generation["output_path"]
+    if not output_path or not Path(output_path).is_file():
+        return False, "队列结果文件不存在"
+    return True, None
+
+
+def _analysis_payload(conn, row) -> dict:
+    is_current, stale_reason = _analysis_currency(conn, row)
+    result = None
+    if row["status"] == config.STATUS_DONE and is_current:
+        # The result table is only ever emitted while it is current.
+        result = json.loads(row["result_json"])
+    return {
+        "id": row["id"],
+        "status": row["status"],
+        "generation_id": row["generation_id"],
+        "selection_version": row["selection_version"],
+        "intervals": json.loads(row["intervals_json"]),
+        "error": row["error"],
+        "is_current": is_current,
+        "stale_reason": stale_reason,
+        "created_at": row["created_at"],
+        "started_at": row["started_at"],
+        "finished_at": row["finished_at"],
+        "result": result,
     }
 
 
@@ -241,6 +293,42 @@ def download(batch_id: str):
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
+
+
+# --------------------------------------------------------------------------- #
+# Low-frequency interval analysis
+# --------------------------------------------------------------------------- #
+class IntervalIn(BaseModel):
+    gene: str
+    chrom: str
+    start: int
+    end: int
+
+
+class AnalysisRequest(BaseModel):
+    intervals: list[IntervalIn]
+
+
+@app.post("/api/batches/{batch_id}/analyses")
+def create_analysis(batch_id: str, payload: AnalysisRequest):
+    try:
+        service.start_analysis(
+            batch_id, [iv.model_dump() for iv in payload.intervals]
+        )
+    except AnalysisError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc))
+    with db.get_db() as conn:
+        row = db.get_latest_analysis(conn, batch_id)
+        return _analysis_payload(conn, row)
+
+
+@app.get("/api/batches/{batch_id}/analyses/latest")
+def latest_analysis(batch_id: str):
+    with db.get_db() as conn:
+        if db.get_batch(conn, batch_id) is None:
+            raise HTTPException(status_code=404, detail="批次不存在")
+        row = db.get_latest_analysis(conn, batch_id)
+        return {"analysis": _analysis_payload(conn, row) if row else None}
 
 
 @app.get("/", response_class=HTMLResponse)
